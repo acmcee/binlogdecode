@@ -27,7 +27,6 @@ my (%do_dbs,%do_tbs);
 my $part_where ='';
 # 用来表示where部分的值
 my $is_where =1;
-# tbname=>tbcol, tbcol: @n=>colname,type
 my %tbcol_pos;
 
 my $SPLITER_COL = ',';

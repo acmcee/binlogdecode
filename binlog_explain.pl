@@ -24,6 +24,9 @@ my ($MYSQL, $MYSQLBINLOG, $ROLLBACK_DML);
 my $outfile = '/dev/null';
 my (%do_dbs,%do_tbs);
 
+my $part_where ='';
+# 用来表示where部分的值
+my $is_where =1;
 # tbname=>tbcol, tbcol: @n=>colname,type
 my %tbcol_pos;
 
@@ -37,15 +40,15 @@ my $SQLAREA_SET = 'SET';
 my $PRE_FUNCT = '========================== ';
 
 # =========================================================
-# 基于row模式的binlog，生成DML(insert/update/delete)的rollback语句
+# 基于row模式的binlog，生成DML(insert/update/delete)的正向语句
 # 通过mysqlbinlog -v 解析binlog生成可读的sql文件
 # 提取需要处理的有效sql
 #     "### "开头的行.如果输入的start-position位于某个event group中间，则会导致"无法识别event"错误
 #
 # 将INSERT/UPDATE/DELETE 的sql反转,并且1个完整sql只能占1行
-#     INSERT: INSERT INTO => DELETE FROM, SET => WHERE
-#     UPDATE: WHERE => SET, SET => WHERE
-#     DELETE: DELETE FROM => INSERT INTO, WHERE => SET
+#     INSERT: INSERT INTO => INSERT INTO, SET => SET
+#     UPDATE: WHERE => WHERE, SET => SET,需要将 WHERE 部分追加到最后
+#     DELETE: DELETE FROM => DELETE FROM, WHERE => WHERE
 # 用列名替换位置@{1,2,3}/
 #     通过desc table获得列顺序及对应的列名
 #     特殊列类型value做特别处理
@@ -77,21 +80,21 @@ sub main{
 sub get_options{
     #Get options info
     GetOptions(\%opt,
-        'help',                     # OUT : print help info   
-        'f|srcfile=s',              # IN  : binlog file
-        'o|outfile=s',              # out : output sql file
-        'h|host=s',                 # IN  : host
-        'u|user=s',                 # IN  : user
-        'p|password=s',             # IN  : password
-        'P|port=i',                 # IN  : port
-        'start-datetime=s',         # IN  : start datetime
-        'stop-datetime=s',          # IN  : stop datetime
-        'start-position=i',         # IN  : start position
-        'stop-position=i',          # IN  : stop position
-        'd|database=s',             # IN  : database, split comma
-        'T|table=s',                # IN  : table, split comma
-        'i|ignore',                 # IN  : ignore binlog check ddl and so on
-        'debug',                    # IN  : print debug information
+        'help',                    # OUT :  print help info   
+        'f|srcfile=s',             # IN  :  binlog file
+        'o|outfile=s',             # out :  output sql file
+        'h|host=s',                # IN  :  host
+        'u|user=s',                # IN  :  user
+        'p|password=s',            # IN  :  password
+        'P|port=i',                # IN  :  port
+        'start-datetime=s',        # IN  :  start datetime
+        'stop-datetime=s',         # IN  :  stop datetime
+        'start-position=i',        # IN  :  start position
+        'stop-position=i',         # IN  :  stop position
+        'd|database=s',            # IN  :  database, split comma
+        'T|table=s',               # IN  :  table, split comma
+        'i|ignore',                # IN  :  ignore binlog check ddl and so on
+        'debug',                   # IN  :  print debug information
       ) or print_usage();
 
     if (!scalar(%opt)) {
@@ -279,27 +282,32 @@ sub do_binlog_rollback{
         if ($line =~ /^(INSERT|UPDATE|DELETE)/){
             # export sql
             if ($sqlstr ne ''){
+                #进行导出，将where部分追加到sqlstr里面，然后清空part_where变量
+                $sqlstr .= $part_where;
                 $sqlstr .= ";\n";
+                $part_where = '';
                 print SQLFILE $sqlstr;
                 &mdebug("export sql\n\t".$sqlstr);
                 $sqlstr = '';
+                #$part_where = '';
             }
 
             if ($line =~ /^INSERT/){
                 $sqltype = $SQLTYPE_IST;
                 $tbname = `echo '$line' | awk '{print \$3}'`;
                 chomp($tbname);
-                $sqlstr = qq{DELETE FROM $tbname};
+                $sqlstr = qq{INSERT INTO $tbname};
             }elsif ($line =~ /^UPDATE/){
                 $sqltype = $SQLTYPE_UPD;
                 $tbname = `echo '$line' | awk '{print \$2}'`;
                 chomp($tbname);
                 $sqlstr = qq{UPDATE $tbname};
+            #print $tbname
             }elsif ($line =~ /^DELETE/){
                 $sqltype = $SQLTYPE_DEL;    
                 $tbname = `echo '$line' | awk '{print \$3}'`;
                 chomp($tbname);
-                $sqlstr = qq{INSERT INTO $tbname};
+                $sqlstr = qq{DELETE FROM $tbname};
             }
 
             # check ignore table
@@ -316,15 +324,26 @@ sub do_binlog_rollback{
                 &merror("can't get tbname") unless (defined($tbname));
                 if ($line =~ /^WHERE/){
                     $sqlarea = $SQLAREA_WHERE;
-                    $sqlstr .= qq{ SET};
+                    $part_where .= qq{ WHERE};
+                    #print $sqlstr
                     $isareabegin = 1;
+                    $is_where= 1;
                 }elsif ($line =~ /^SET/){
                     $sqlarea = $SQLAREA_SET;
-                    $sqlstr .= qq{ WHERE};
+                    # 设置insert语句的后半部分
+                    $sqlstr .= qq{ SET };
                     $isareabegin = 1;
+                    $is_where = 0;
                 }elsif ($line =~ /^\@/){
-                    $sqlstr .= &deal_col_value($tbname, $sqltype, $sqlarea, $isareabegin, $line);
-                    $isareabegin = 0;
+                    if ($is_where == 1 ){
+                    #判断语句是否是在where部分，如果是的话，将值赋给part_where变量
+                        $part_where .=&deal_col_value($tbname, $sqltype, $sqlarea, $isareabegin, $line);
+                        $isareabegin = 0;
+                     }else {
+                     #如果不是where部分，那么将赋值给sqlstr
+                         $sqlstr .= &deal_col_value($tbname, $sqltype, $sqlarea, $isareabegin, $line);
+                         $isareabegin = 0;
+                     }
                 }else{
                     &mdebug("::unknown sql:".$line);
                 }
@@ -333,7 +352,10 @@ sub do_binlog_rollback{
     }
     # export last sql
     if ($sqlstr ne ''){
+        #进行导出，将where部分追加到sqlstr里面，然后清空part_where变量
+        $sqlstr .= $part_where;
         $sqlstr .= ";\n";
+        $part_where = '';
         print SQLFILE $sqlstr;
         &mdebug("export sql\n\t".$sqlstr);
     }
@@ -342,13 +364,15 @@ sub do_binlog_rollback{
 
     close SQLFILE or die "Can't close out sql file: $outfile";
 
-    # 逆序
-    # 1!G: 只有第一行不执行G, 将hold space中的内容append回到pattern space
-    # h: 将pattern space 拷贝到hold space
-    # $!d: 除最后一行都删除
-    my $invert = "sed -i '1!G;h;\$!d' $outfile";
+    #
+    #############################################
+    #
+    #这里只是进行判断文件是否存在，不进行反转
+    #
+    my $invert = "[ -f $outfile ]";
     my $res = `$invert`;
     &mdebug("inverter order sqlfile :$invert");
+    #############################################
 }
 
 # ----------------------------------------------------------------------------------------
@@ -375,12 +399,12 @@ sub deal_col_value($$$$$){
     if ($isareabegin){
         $joinstr = ' ';
     }else{
-        # WHERE 被替换为 SET, 使用 ,  连接
+        # WHERE 语句中的值用AND 连接
         if ($sqlarea eq $SQLAREA_WHERE){
-            $joinstr = ', ';
-        # SET 被替换为 WHERE 使用 AND 连接
-        }elsif ($sqlarea eq $SQLAREA_SET){
             $joinstr = ' AND ';
+        # SET 语句中用逗号连接
+        }elsif ($sqlarea eq $SQLAREA_SET){
+            $joinstr = ' , ';
         }else{
             &merror("!!!!!!The scripts error");
         }
@@ -390,9 +414,9 @@ sub deal_col_value($$$$$){
     my $newline = $joinstr;
 
     # NULL value
-    #这里只判断值是否是null，如果是null，那么就将= 变成is
     #if (($val eq 'NULL') && ($sqlarea eq $SQLAREA_SET)){
-    if ($val eq 'NULL') {
+    #这里只判断值是否是null，如果是null，那么就将= 变成is
+    if ($val eq 'NULL'){
         $newline .= qq{ $cname IS NULL};
     }else{
         # timestamp: record seconds
@@ -400,8 +424,8 @@ sub deal_col_value($$$$$){
             $newline .= qq{$cname=from_unixtime($val)};
         # datetime: @n=yyyy-mm-dd hh::ii::ss
         }elsif ($ctype eq 'datetime'){
-            #$newline .= qq{$cname='$val'};
             #日期格式在5.7中发现已经包含单引号，因此不需要进行添加单引号操作
+            #$newline .= qq{$cname='$val'};
             $newline .= qq{$cname=$val};
         }else{
             #在binlog中会将单引号转成16进制
@@ -493,14 +517,14 @@ Command line options :
     --debug                  # IN  : print debug information
 
 Sample :
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' 
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' -i
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --debug
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -h '192.168.1.2' -u 'user' -p 'pwd' -P 3307
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --start-position=107
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --start-position=107 --stop-position=10000
-   shell> perl binlog-rollback.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' -d 'db1,db2'
-   shell> perl binlog-rollback.pl -f 'mysql-bin.0000*' -o '/tmp/t.sql' -u 'user' -p 'pwd' -d 'db1,db2' -T 'tb1,tb2'
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' 
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' -i
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --debug
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -h '192.168.1.2' -u 'user' -p 'pwd' -P 3307
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --start-position=107
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' --start-position=107 --stop-position=10000
+   shell> perl binlog-explain.pl -f 'mysql-bin.000001' -o '/tmp/t.sql' -u 'user' -p 'pwd' -d 'db1,db2'
+   shell> perl binlog-explain.pl -f 'mysql-bin.0000*' -o '/tmp/t.sql' -u 'user' -p 'pwd' -d 'db1,db2' -T 'tb1,tb2'
 ==========================================================================================
 EOF
     exit;   
